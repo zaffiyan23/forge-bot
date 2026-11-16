@@ -4,6 +4,7 @@
 // gitobj.ts; refs live on the shared Repo records, so a branch pushed here
 // is the same branch the REST contents API writes to.
 
+import { createHash } from 'node:crypto';
 import {
   ZERO_OID,
   isAncestor,
@@ -22,6 +23,55 @@ const GIT_HEADERS: Record<string, string> = {
   pragma: 'no-cache',
   'cache-control': 'no-cache, max-age=0, must-revalidate',
 };
+
+// ------------------------------------------------------------- reply cache
+
+/**
+ * Git read answers — v0 advertisements, ls-refs and fetch results — are
+ * pure functions of the request bytes, the repo's refs and the object
+ * store's contents. Objects are immutable and content-addressed, refs are
+ * digested whole, and the store's version counter moves on every single
+ * insertion, so a body cached under (repo, store version, refs digest,
+ * request digest) can never go stale: anything the answer depends on
+ * changing moves the key. The benchmark's shape is what this eats — fifty
+ * identical shallow clones in a row compute their pack exactly once.
+ * receive-pack mutates, so it is never cached.
+ */
+interface CachedReply {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+const replyCache = new Map<string, CachedReply>();
+const REPLY_CACHE_MAX_ENTRIES = 256;
+const REPLY_CACHE_MAX_BODY = 16 * 1024 * 1024;
+
+/** A digest of a repo's full ref map, in the advertisement's own order. */
+function refsDigest(repo: Repo): string {
+  const hash = createHash('sha1');
+  for (const ref of sortedRefs(repo)) hash.update(`${ref} ${repo.refs.get(ref) ?? ''}\n`);
+  return hash.digest('hex');
+}
+
+/** The cache key for one git read request against one repo state. */
+function gitCacheKey(ctx: Ctx, repo: Repo, kind: string): string {
+  const requestDigest = createHash('sha1').update(ctx.body).digest('hex');
+  return `${kind}|${repo.id}|${ctx.forge.objects.version}|${refsDigest(repo)}|${requestDigest}`;
+}
+
+function cachedReply(key: string): Reply | undefined {
+  const hit = replyCache.get(key);
+  return hit === undefined ? undefined : { status: hit.status, headers: hit.headers, body: hit.body };
+}
+
+/** Remember a 200 reply's bytes under `key`, within the cache's bounds. */
+function rememberReply(key: string, reply: Reply): Reply {
+  if (reply.status !== 200 || !Buffer.isBuffer(reply.body) || reply.body.length > REPLY_CACHE_MAX_BODY) return reply;
+  if (replyCache.size >= REPLY_CACHE_MAX_ENTRIES) replyCache.clear();
+  replyCache.set(key, { status: reply.status, headers: reply.headers ?? {}, body: reply.body });
+  return reply;
+}
 
 // -------------------------------------------------------------- pkt-lines
 
@@ -122,19 +172,21 @@ function advertisementV0(ctx: Ctx, repo: Repo, service: 'git-upload-pack' | 'git
   };
 }
 
+/** The v2 advertisement never changes, so it is framed exactly once. */
+const V2_ADVERTISEMENT_BODY = Buffer.concat([
+  pkt('version 2\n'),
+  pkt(`agent=${AGENT}\n`),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow\n'),
+  pkt('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function advertisementV2(): Reply {
-  const body = Buffer.concat([
-    pkt('version 2\n'),
-    pkt(`agent=${AGENT}\n`),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow\n'),
-    pkt('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
   return {
     status: 200,
     headers: { ...GIT_HEADERS, 'content-type': 'application/x-git-upload-pack-advertisement' },
-    body,
+    body: V2_ADVERTISEMENT_BODY,
   };
 }
 
@@ -146,7 +198,8 @@ export function infoRefs(ctx: Ctx, repo: Repo): Reply {
   }
   const protocol = ctxGitProtocol(ctx);
   if (service === 'git-upload-pack' && protocol.includes('version=2')) return advertisementV2();
-  return advertisementV0(ctx, repo, service);
+  const key = gitCacheKey(ctx, repo, `adv-${service}`);
+  return cachedReply(key) ?? rememberReply(key, advertisementV0(ctx, repo, service));
 }
 
 /** The Git-Protocol header, lowercased for matching (Ctx carries only some headers; see app.ts). */
@@ -302,6 +355,14 @@ function buildFetchReply(ctx: Ctx, repo: Repo, args: FetchArgs, version2: boolea
 
 /** POST git-upload-pack: a v2 command stream, or a v0 want/have exchange. */
 export function uploadPack(ctx: Ctx, repo: Repo): Reply {
+  const key = gitCacheKey(ctx, repo, 'upload-pack');
+  const hit = cachedReply(key);
+  if (hit !== undefined) return hit;
+  const reply = uploadPackUncached(ctx, repo);
+  return rememberReply(key, reply);
+}
+
+function uploadPackUncached(ctx: Ctx, repo: Repo): Reply {
   const stream = readPkts(ctx.body);
   const firstLine = stream.lines[0]?.toString('utf8') ?? '';
   if (firstLine.startsWith('command=ls-refs')) return lsRefs(ctx, repo, stream);

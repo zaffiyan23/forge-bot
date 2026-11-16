@@ -3,74 +3,67 @@
 // enforces the bearer token everywhere but the boot probe, stamps every
 // reply with a request id, and never lets a handler's exception take the
 // process down — a trial grades liveness as much as correctness.
+//
+// The transport is rawhttp.ts, a hand-rolled HTTP/1.1 stack on node:net:
+// the suite's load is thousands of small keep-alive requests, and the
+// measured cost of node:http's per-request machinery (llhttp bindings,
+// request/response objects, URL parsing) rivalled the handlers themselves.
+// Routing and every surface below the transport are unchanged by the swap.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:http';
 import { RequestIds } from './clock.ts';
 import { infoRefs, receivePack, uploadPack } from './githttp.ts';
 import { handleGraphQL } from './graphql.ts';
 import type { Ctx, Reply } from './http.ts';
 import { errorReply, jsonReply } from './http.ts';
 import { handleMcp } from './mcp.ts';
+import { RawHttpServer, type RawReply, type RawRequest } from './rawhttp.ts';
 import { handleRest } from './rest.ts';
 import type { Forge } from './store.ts';
-
-/** The largest request body the forge will read (packs for big pushes). */
-const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
 export interface AppOptions {
   /** The trial token every surface demands; '' disables auth (local runs). */
   token: string;
 }
 
+/** Shared empty parameter set for the (very common) query-less request. */
+const EMPTY_QUERY = new URLSearchParams();
+
 /** Build the server around a forge instance. It binds nothing until listened. */
 export function createForgeServer(forge: Forge, options: AppOptions): Server {
   const requestIds = new RequestIds();
-  const server = createServer({ sendDate: false }, (req, res) => {
-    void serve(req, res).catch(() => {
-      // serve() already guards its own work; this is the last resort.
-      try {
-        if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
-        res.end('{"message":"Internal error"}');
-      } catch {
-        // The socket is gone; nothing more to do.
-      }
-    });
-  });
-  server.keepAliveTimeout = 30_000;
-  return server;
+  const server = new RawHttpServer((req) => serve(req));
+  // main.ts drives this through the http.Server surface (listen/address/
+  // once/close); RawHttpServer provides exactly those members.
+  return server as unknown as Server;
 
-  async function serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  function serve(req: RawRequest): RawReply {
     const requestId = requestIds.next();
     let reply: Reply;
     try {
-      const body = await readBody(req);
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const rawPath = url.pathname;
-      const segments = splitPath(rawPath);
+      const queryAt = req.target.indexOf('?');
+      const rawPath = queryAt === -1 ? req.target : req.target.slice(0, queryAt);
       const ctx: Ctx = {
         forge,
-        method: req.method ?? 'GET',
-        segments,
+        method: req.method,
+        segments: splitPath(rawPath),
         rawPath,
-        query: url.searchParams,
-        body,
-        host: req.headers.host ?? '127.0.0.1',
-        authorization: typeof req.headers.authorization === 'string' ? req.headers.authorization : null,
-        gitProtocol: typeof req.headers['git-protocol'] === 'string' ? (req.headers['git-protocol'] as string) : '',
+        query: queryAt === -1 ? EMPTY_QUERY : new URLSearchParams(req.target.slice(queryAt + 1)),
+        body: req.body,
+        host: req.header('host') ?? '127.0.0.1',
+        authorization: req.header('authorization') ?? null,
+        gitProtocol: req.header('git-protocol') ?? '',
       };
       reply = route(ctx);
     } catch (error) {
       process.stderr.write(`[forge] request failed: ${error instanceof Error ? error.message : String(error)}\n`);
       reply = errorReply(500, 'Internal error');
     }
-    const bodyBuffer =
-      reply.body === undefined ? Buffer.alloc(0) : typeof reply.body === 'string' ? Buffer.from(reply.body, 'utf8') : reply.body;
-    res.writeHead(reply.status, {
-      'x-github-request-id': requestId,
-      'content-length': bodyBuffer.length,
-      ...(reply.headers ?? {}),
-    });
-    res.end(bodyBuffer);
+    return {
+      status: reply.status,
+      headers: { 'x-github-request-id': requestId, ...(reply.headers ?? {}) },
+      body: reply.body,
+    };
   }
 
   /** Route one request to its surface. Authentication comes first. */
@@ -132,37 +125,23 @@ function authorized(header: string | null, token: string): boolean {
   return false;
 }
 
-/** Read a request body whole, with a generous cap for pack uploads. */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
-        reject(new Error('request body too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
 /** Split a URL path into decoded segments ('/' → []). */
 function splitPath(rawPath: string): string[] {
-  return rawPath
-    .split('/')
-    .filter((part) => part !== '')
-    .map((part) => {
-      try {
-        return decodeURIComponent(part);
-      } catch {
-        return part;
-      }
-    });
+  const parts = rawPath.split('/');
+  const segments: string[] = [];
+  for (const part of parts) {
+    if (part === '') continue;
+    if (!part.includes('%')) {
+      segments.push(part);
+      continue;
+    }
+    try {
+      segments.push(decodeURIComponent(part));
+    } catch {
+      segments.push(part);
+    }
+  }
+  return segments;
 }
 
 interface GitPath {

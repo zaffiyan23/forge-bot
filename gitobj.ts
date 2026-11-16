@@ -28,11 +28,25 @@ export interface StoredObject {
 /** Every object the forge knows, by id. One store for all repositories. */
 export class ObjectStore {
   private readonly objects = new Map<string, StoredObject>();
+  private versionCounter = 0;
+
+  /**
+   * How many distinct objects have ever been inserted. Objects are
+   * immutable and never deleted, so this counter versions the store's
+   * whole contents: any answer derived from the store is a pure function
+   * of the inputs plus this version (the git HTTP reply cache keys on it).
+   */
+  get version(): number {
+    return this.versionCounter;
+  }
 
   /** Store a payload, returning its id (idempotent). */
   put(type: ObjType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.versionCounter += 1;
+    }
     return oid;
   }
 

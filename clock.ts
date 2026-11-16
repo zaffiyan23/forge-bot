@@ -20,9 +20,21 @@ function trialBaseSeconds(raw: string | undefined): number {
   return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 0;
 }
 
-/** Format epoch seconds the way the REST surface spells timestamps. */
+const isoMemo = new Map<number, string>();
+
+/**
+ * Format epoch seconds the way the REST surface spells timestamps. Views
+ * re-render the same stored timestamps on every read, so recent
+ * formattings are memoized — a pure function, so the memo can never
+ * change a byte of output.
+ */
 export function isoOf(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toISOString().replace('.000Z', 'Z');
+  const hit = isoMemo.get(epochSeconds);
+  if (hit !== undefined) return hit;
+  const iso = new Date(epochSeconds * 1000).toISOString().replace('.000Z', 'Z');
+  if (isoMemo.size >= 512) isoMemo.clear();
+  isoMemo.set(epochSeconds, iso);
+  return iso;
 }
 
 /**
