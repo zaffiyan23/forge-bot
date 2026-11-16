@@ -30,7 +30,12 @@ export interface RawReply {
   status: number;
   headers?: Record<string, string>;
   body?: string | Buffer;
+  /** Emitted as the x-github-request-id header, ahead of `headers`. */
+  requestId?: string;
 }
+
+/** The one empty body every bodyless request shares (handlers only read). */
+const EMPTY_BODY = Buffer.alloc(0);
 
 /** The app handler: synchronous in practice; a promise is also accepted. */
 type Handler = (req: RawRequest) => RawReply | Promise<RawReply>;
@@ -116,12 +121,21 @@ export class RawHttpServer extends EventEmitter {
   }
 }
 
+/** The reply a handler's own failure produces (app.ts shapes its the same). */
+const INTERNAL_ERROR_REPLY: RawReply = {
+  status: 500,
+  headers: { 'content-type': 'application/json' },
+  body: '{"message":"Internal error"}',
+};
+
 /** One socket's request/response loop: parse, dispatch, answer, repeat. */
 class Connection {
   private readonly socket: Socket;
   private readonly handler: Handler;
   private buffer: Buffer = Buffer.alloc(0);
   private busy = false;
+  /** Paused mid-stream: the socket's write buffer has not drained yet. */
+  private blocked = false;
   private dead = false;
   /** headEnd offset a 100-continue prompt was already sent for. */
   private continuePromptedFor = -1;
@@ -139,13 +153,20 @@ class Connection {
         this.socket.destroy();
         return;
       }
-      void this.pump();
+      this.pump();
     });
   }
 
-  /** Consume as many whole requests as the buffer currently holds. */
-  private async pump(): Promise<void> {
-    if (this.busy || this.dead) return;
+  /**
+   * Consume as many whole requests as the buffer currently holds. The
+   * forge's handler is synchronous, so the common path never leaves the
+   * tick: no promise is created per request. A handler that does return
+   * a promise (none does today) finishes through the continuation, and a
+   * full write buffer pauses the loop until the drain callback resumes
+   * it — the same strict request/response serialization as before.
+   */
+  private pump(): void {
+    if (this.busy || this.blocked || this.dead) return;
     this.busy = true;
     try {
       for (;;) {
@@ -154,21 +175,39 @@ class Connection {
         if (parsed === 'bad') {
           this.dead = true;
           this.socket.destroy();
-          return;
+          break;
         }
-        const keepAlive = await this.dispatch(parsed);
-        if (!keepAlive || this.dead) {
+        let out: RawReply | Promise<RawReply>;
+        try {
+          out = this.handler(parsed);
+        } catch {
+          out = INTERNAL_ERROR_REPLY;
+        }
+        if (out instanceof Promise) {
+          const settle = (reply: RawReply): void => {
+            this.busy = false;
+            try {
+              if (this.writeReply(parsed, reply) === 'ok') this.pump();
+            } catch {
+              this.dead = true;
+              this.socket.destroy();
+            }
+          };
+          out.then(settle, () => settle(INTERNAL_ERROR_REPLY));
+          return; // busy stays set until the continuation clears it
+        }
+        const step = this.writeReply(parsed, out);
+        if (step === 'ended') {
           this.dead = true;
-          this.socket.end();
-          return;
+          break;
         }
+        if (step === 'blocked') break; // the drain callback resumes the loop
       }
     } catch {
       this.dead = true;
       this.socket.destroy();
-    } finally {
-      this.busy = false;
     }
+    this.busy = false;
   }
 
   /**
@@ -181,8 +220,8 @@ class Connection {
       return this.buffer.length > MAX_HEAD_BYTES ? 'bad' : null;
     }
     const headText = this.buffer.toString('latin1', 0, headEnd);
-    const lines = headText.split('\r\n');
-    const requestLine = lines[0]!;
+    const firstBreak = headText.indexOf('\r\n');
+    const requestLine = firstBreak === -1 ? headText : headText.slice(0, firstBreak);
     const space1 = requestLine.indexOf(' ');
     const space2 = requestLine.lastIndexOf(' ');
     if (space1 <= 0 || space2 <= space1) return 'bad';
@@ -191,20 +230,28 @@ class Connection {
     const httpVersion = requestLine.slice(space2 + 1);
     if (!httpVersion.startsWith('HTTP/')) return 'bad';
 
-    const headers = new Map<string, string>();
-    for (let i = 1; i < lines.length; i += 1) {
-      const line = lines[i]!;
-      const colon = line.indexOf(':');
-      if (colon <= 0) continue;
-      const name = line.slice(0, colon).trim().toLowerCase();
-      if (!WANTED_HEADERS.has(name) || headers.has(name)) continue;
-      headers.set(name, line.slice(colon + 1).trim());
+    // Scan the header block line by line without splitting it into an
+    // array of lines first; only the wanted names are ever materialized.
+    const headers: Record<string, string | undefined> = {};
+    let pos = firstBreak === -1 ? headText.length : firstBreak + 2;
+    while (pos < headText.length) {
+      const next = headText.indexOf('\r\n', pos);
+      const end = next === -1 ? headText.length : next;
+      const colon = headText.indexOf(':', pos);
+      if (colon > pos && colon < end) {
+        const name = headText.slice(pos, colon).trim().toLowerCase();
+        if (WANTED_HEADERS.has(name) && headers[name] === undefined) {
+          headers[name] = headText.slice(colon + 1, end).trim();
+        }
+      }
+      if (next === -1) break;
+      pos = next + 2;
     }
 
     const bodyStart = headEnd + 4;
     let body: Buffer;
     let consumed: number;
-    const transferEncoding = headers.get('transfer-encoding');
+    const transferEncoding = headers['transfer-encoding'];
     if (transferEncoding !== undefined && transferEncoding.toLowerCase().includes('chunked')) {
       const decoded = decodeChunked(this.buffer, bodyStart);
       if (decoded === null) return null;
@@ -212,48 +259,46 @@ class Connection {
       body = decoded.body;
       consumed = decoded.end;
     } else {
-      const lengthHeader = headers.get('content-length');
+      const lengthHeader = headers['content-length'];
       const length = lengthHeader === undefined ? 0 : Number(lengthHeader);
       if (!Number.isInteger(length) || length < 0) return 'bad';
       if (this.buffer.length - bodyStart < length) {
         // A client that announced a body it is still sending after a
         // 100-continue prompt gets the prompt once, when the head lands.
-        if (headers.get('expect')?.toLowerCase() === '100-continue' && this.continuePromptedFor !== headEnd) {
+        if (headers['expect']?.toLowerCase() === '100-continue' && this.continuePromptedFor !== headEnd) {
           this.continuePromptedFor = headEnd;
           this.socket.write('HTTP/1.1 100 Continue\r\n\r\n');
         }
         return null;
       }
-      body = length === 0 ? Buffer.alloc(0) : this.buffer.subarray(bodyStart, bodyStart + length);
+      body = length === 0 ? EMPTY_BODY : this.buffer.subarray(bodyStart, bodyStart + length);
       consumed = bodyStart + length;
     }
 
-    const connection = headers.get('connection')?.toLowerCase() ?? '';
+    const connection = headers['connection']?.toLowerCase() ?? '';
     const keepAlive = httpVersion === 'HTTP/1.0' ? connection === 'keep-alive' : connection !== 'close';
     this.continuePromptedFor = -1;
-    this.buffer = consumed >= this.buffer.length ? Buffer.alloc(0) : this.buffer.subarray(consumed);
+    this.buffer = consumed >= this.buffer.length ? EMPTY_BODY : this.buffer.subarray(consumed);
     return {
       method,
       target,
       httpVersion,
-      header: (name: string) => headers.get(name),
+      header: (name: string) => headers[name],
       body,
       keepAlive,
     };
   }
 
-  /** Run the handler for one request and write its reply. */
-  private async dispatch(req: RawRequest & { keepAlive: boolean }): Promise<boolean> {
-    let reply: RawReply;
-    try {
-      const out = this.handler(req);
-      reply = out instanceof Promise ? await out : out;
-    } catch {
-      reply = { status: 500, headers: { 'content-type': 'application/json' }, body: '{"message":"Internal error"}' };
-    }
+  /**
+   * Write one reply. 'ok' when the loop may continue with the next
+   * request, 'blocked' when the write buffer is full (the drain callback
+   * resumes the loop), 'ended' when the socket is closing either way.
+   */
+  private writeReply(req: RawRequest & { keepAlive: boolean }, reply: RawReply): 'ok' | 'blocked' | 'ended' {
     const bodyBuffer =
-      reply.body === undefined ? Buffer.alloc(0) : typeof reply.body === 'string' ? Buffer.from(reply.body, 'utf8') : reply.body;
+      reply.body === undefined ? EMPTY_BODY : typeof reply.body === 'string' ? Buffer.from(reply.body, 'utf8') : reply.body;
     let head = `HTTP/1.1 ${reply.status} ${REASONS[reply.status] ?? ''}\r\n`;
+    if (reply.requestId !== undefined) head += `x-github-request-id: ${reply.requestId}\r\n`;
     for (const [name, value] of Object.entries(reply.headers ?? {})) {
       head += `${name}: ${value}\r\n`;
     }
@@ -264,10 +309,19 @@ class Connection {
     const sendBody = req.method !== 'HEAD' && bodyBuffer.length > 0;
     const payload = sendBody ? Buffer.concat([headBuffer, bodyBuffer]) : headBuffer;
     const flushed = this.socket.write(payload);
-    if (!flushed) {
-      await new Promise<void>((resolve) => this.socket.once('drain', resolve));
+    if (!req.keepAlive) {
+      this.socket.end();
+      return 'ended';
     }
-    return req.keepAlive;
+    if (!flushed) {
+      this.blocked = true;
+      this.socket.once('drain', () => {
+        this.blocked = false;
+        this.pump();
+      });
+      return 'blocked';
+    }
+    return 'ok';
   }
 }
 

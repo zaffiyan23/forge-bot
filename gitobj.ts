@@ -16,8 +16,7 @@ export const ZERO_OID = '0000000000000000000000000000000000000000';
 
 /** The object id of a payload: sha1 of the git header plus the payload. */
 export function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return createHash('sha1').update(header).update(data).digest('hex');
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 
 export interface StoredObject {
@@ -43,7 +42,7 @@ export class ObjectStore {
   /** Store a payload, returning its id (idempotent). */
   put(type: ObjType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) {
+    if (this.objects.get(oid) === undefined) {
       this.objects.set(oid, { type, data });
       this.versionCounter += 1;
     }
@@ -285,6 +284,25 @@ export function peelToNonTag(store: ObjectStore, oid: string): string {
 
 // ----------------------------------------------------------------- ancestry
 
+/**
+ * Just a commit's parent ids, scanned out of the header block without
+ * building the full CommitInfo (no line split, no timestamp regexes).
+ * Ancestry walks call this once per commit visited; on the push path
+ * that is the whole server-side cost of a fast-forward check.
+ */
+export function commitParents(data: Buffer): string[] {
+  const text = data.toString('utf8');
+  const headEnd = text.indexOf('\n\n');
+  const head = headEnd === -1 ? text : text.slice(0, headEnd);
+  const parents: string[] = [];
+  let at = head.indexOf('\nparent ');
+  while (at !== -1) {
+    parents.push(head.slice(at + 8, at + 48));
+    at = head.indexOf('\nparent ', at + 48);
+  }
+  return parents;
+}
+
 /** All commits reachable from a tip, tip first (DFS pre-order, parents in order). */
 export function ancestryList(store: ObjectStore, tip: string): string[] {
   const seen = new Set<string>();
@@ -297,7 +315,7 @@ export function ancestryList(store: ObjectStore, tip: string): string[] {
     if (object === undefined || object.type !== 'commit') continue;
     seen.add(oid);
     order.push(oid);
-    const parents = parseCommit(object.data).parents;
+    const parents = commitParents(object.data);
     for (let i = parents.length - 1; i >= 0; i -= 1) stack.push(parents[i]!);
   }
   return order;
@@ -315,7 +333,7 @@ export function isAncestor(store: ObjectStore, ancestor: string, descendant: str
     seen.add(oid);
     const object = store.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    for (const parent of commitParents(object.data)) stack.push(parent);
   }
   return false;
 }

@@ -31,11 +31,14 @@ export interface Reply {
   body?: string | Buffer;
 }
 
+/** The one header nearly every reply carries; shared, never mutated. */
+const JSON_HEADERS: Record<string, string> = { 'content-type': 'application/json; charset=utf-8' };
+
 /** A JSON reply with the forge's content type. */
 export function jsonReply(status: number, value: unknown, headers?: Record<string, string>): Reply {
   return {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', ...(headers ?? {}) },
+    headers: headers === undefined ? JSON_HEADERS : { ...JSON_HEADERS, ...headers },
     body: JSON.stringify(value),
   };
 }
@@ -47,15 +50,18 @@ export function errorReply(status: number, message: string): Reply {
 
 /** Parse a request body as JSON; { ok: false } when it is not JSON at all. */
 export function parseJsonBody(ctx: Ctx): { ok: true; value: Record<string, unknown> } | { ok: false } {
-  const text = ctx.body.toString('utf8').trim();
-  if (text === '') return { ok: true, value: {} };
+  if (ctx.body.length === 0) return { ok: true, value: {} };
+  const text = ctx.body.toString('utf8');
   try {
+    // JSON.parse tolerates surrounding whitespace itself; no trim copy.
     const value: unknown = JSON.parse(text);
     if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
       return { ok: true, value: value as Record<string, unknown> };
     }
     return { ok: true, value: {} };
   } catch {
+    // A whitespace-only body meant "no fields" before, and still does.
+    if (/^\s*$/.test(text)) return { ok: true, value: {} };
     return { ok: false };
   }
 }

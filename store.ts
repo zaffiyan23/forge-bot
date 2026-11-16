@@ -44,6 +44,14 @@ export interface Issue {
   labelNames: string[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * The serialized REST view of this issue and the stamp of the state it
+   * was rendered from (see issueJsonText in rest.ts). Every mutation that
+   * can change the rendering bumps updatedAt or the comment count, so a
+   * stamp match proves the cached bytes are still exact.
+   */
+  cachedJson?: string;
+  cachedStamp?: string;
 }
 
 export interface Pull {
@@ -80,6 +88,12 @@ export class Repo {
   updatedAt: string;
   /** Full ref name ("refs/heads/main") → object id. */
   readonly refs = new Map<string, string>();
+  /**
+   * Bumped on every ref mutation through setRef/deleteRef. The git reply
+   * cache digests the ref map whole; this counter lets it notice "nothing
+   * moved" without re-hashing every ref on every request.
+   */
+  refsVersion = 0;
   readonly labels = new Map<string, Label>();
   readonly issues = new Map<number, Issue>();
   readonly pulls = new Map<number, Pull>();
@@ -100,6 +114,17 @@ export class Repo {
 
   get fullName(): string {
     return `${this.owner}/${this.name}`;
+  }
+
+  /** Set a ref and record the mutation for digest memoization. */
+  setRef(ref: string, oid: string): void {
+    this.refs.set(ref, oid);
+    this.refsVersion += 1;
+  }
+
+  /** Delete a ref and record the mutation for digest memoization. */
+  deleteRef(ref: string): void {
+    if (this.refs.delete(ref)) this.refsVersion += 1;
   }
 
   nextNumber(): number {
@@ -295,7 +320,7 @@ export class Forge {
       message: `${pull.title} (#${pull.number})`,
     });
     const sha = this.objects.put('commit', commitData);
-    repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+    repo.setRef(`refs/heads/${pull.baseRef}`, sha);
     pull.state = 'closed';
     pull.merged = true;
     pull.mergeCommitSha = sha;

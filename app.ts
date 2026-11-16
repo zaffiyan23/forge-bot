@@ -29,9 +29,14 @@ export interface AppOptions {
 /** Shared empty parameter set for the (very common) query-less request. */
 const EMPTY_QUERY = new URLSearchParams();
 
+/** Placeholder segment list; only the REST router reads segments, and it
+ *  receives its own split of the path, so nothing else pays for one. */
+const NO_SEGMENTS: string[] = [];
+
 /** Build the server around a forge instance. It binds nothing until listened. */
 export function createForgeServer(forge: Forge, options: AppOptions): Server {
   const requestIds = new RequestIds();
+  const bearer = `Bearer ${options.token}`;
   const server = new RawHttpServer((req) => serve(req));
   // main.ts drives this through the http.Server surface (listen/address/
   // once/close); RawHttpServer provides exactly those members.
@@ -46,9 +51,14 @@ export function createForgeServer(forge: Forge, options: AppOptions): Server {
       const ctx: Ctx = {
         forge,
         method: req.method,
-        segments: splitPath(rawPath),
+        segments: NO_SEGMENTS,
         rawPath,
-        query: queryAt === -1 ? EMPTY_QUERY : new URLSearchParams(req.target.slice(queryAt + 1)),
+        // Only the REST surface and info/refs ever read the query; the
+        // git POSTs and the MCP/GraphQL posts skip the parse entirely.
+        query:
+          queryAt === -1 || !(rawPath.startsWith('/api/v3') || rawPath.endsWith('/info/refs'))
+            ? EMPTY_QUERY
+            : new URLSearchParams(req.target.slice(queryAt + 1)),
         body: req.body,
         host: req.header('host') ?? '127.0.0.1',
         authorization: req.header('authorization') ?? null,
@@ -61,8 +71,9 @@ export function createForgeServer(forge: Forge, options: AppOptions): Server {
     }
     return {
       status: reply.status,
-      headers: { 'x-github-request-id': requestId, ...(reply.headers ?? {}) },
+      headers: reply.headers,
       body: reply.body,
+      requestId,
     };
   }
 
@@ -72,7 +83,7 @@ export function createForgeServer(forge: Forge, options: AppOptions): Server {
     if (ctx.method === 'GET' && ctx.rawPath === '/healthz') {
       return jsonReply(200, { ok: true });
     }
-    if (options.token !== '' && !authorized(ctx.authorization, options.token)) {
+    if (options.token !== '' && !authorized(ctx.authorization, options.token, bearer)) {
       const reply = errorReply(401, 'Unauthorized');
       reply.headers = { ...(reply.headers ?? {}), 'www-authenticate': 'Basic realm="forge"' };
       return reply;
@@ -87,8 +98,8 @@ export function createForgeServer(forge: Forge, options: AppOptions): Server {
       if (ctx.method !== 'POST') return errorReply(404, 'Not Found');
       return handleGraphQL(ctx);
     }
-    if (ctx.segments[0] === 'api' && ctx.segments[1] === 'v3') {
-      return handleRest(ctx, ctx.segments.slice(2));
+    if (ctx.rawPath === '/api/v3' || ctx.rawPath.startsWith('/api/v3/')) {
+      return handleRest(ctx, splitPath(ctx.rawPath).slice(2));
     }
     const git = matchGitPath(ctx.rawPath);
     if (git !== null) {
@@ -108,9 +119,9 @@ export function createForgeServer(forge: Forge, options: AppOptions): Server {
  * the suite sends on every surface) or, for real git clients, as the
  * password (or username) of a Basic credential.
  */
-function authorized(header: string | null, token: string): boolean {
+function authorized(header: string | null, token: string, bearer: string): boolean {
   if (header === null) return false;
-  if (header === `Bearer ${token}`) return true;
+  if (header === bearer) return true;
   if (header.startsWith('Basic ')) {
     try {
       const decoded = Buffer.from(header.slice('Basic '.length), 'base64').toString('utf8');

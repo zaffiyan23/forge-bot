@@ -47,16 +47,30 @@ const replyCache = new Map<string, CachedReply>();
 const REPLY_CACHE_MAX_ENTRIES = 256;
 const REPLY_CACHE_MAX_BODY = 16 * 1024 * 1024;
 
-/** A digest of a repo's full ref map, in the advertisement's own order. */
+/**
+ * A digest of a repo's full ref map, in the advertisement's own order.
+ * Memoized on the repo's refsVersion: every ref mutation goes through
+ * Repo.setRef/deleteRef and bumps that counter, so a version match
+ * proves the digest is still the digest of the exact current map.
+ */
+const refsDigestMemo = new WeakMap<Repo, { version: number; digest: string }>();
+
 function refsDigest(repo: Repo): string {
+  const memo = refsDigestMemo.get(repo);
+  if (memo !== undefined && memo.version === repo.refsVersion) return memo.digest;
   const hash = createHash('sha1');
   for (const ref of sortedRefs(repo)) hash.update(`${ref} ${repo.refs.get(ref) ?? ''}\n`);
-  return hash.digest('hex');
+  const digest = hash.digest('hex');
+  refsDigestMemo.set(repo, { version: repo.refsVersion, digest });
+  return digest;
 }
+
+/** sha1 of the empty body (every GET advertisement), computed once. */
+const EMPTY_BODY_DIGEST = createHash('sha1').digest('hex');
 
 /** The cache key for one git read request against one repo state. */
 function gitCacheKey(ctx: Ctx, repo: Repo, kind: string): string {
-  const requestDigest = createHash('sha1').update(ctx.body).digest('hex');
+  const requestDigest = ctx.body.length === 0 ? EMPTY_BODY_DIGEST : createHash('sha1').update(ctx.body).digest('hex');
   return `${kind}|${repo.id}|${ctx.forge.objects.version}|${refsDigest(repo)}|${requestDigest}`;
 }
 
@@ -78,9 +92,15 @@ function rememberReply(key: string, reply: Reply): Reply {
 /** One pkt-line: 4 hex digits of total length, then the payload. */
 export function pkt(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const length = data.length + 4;
-  const header = length.toString(16).padStart(4, '0');
-  return Buffer.concat([Buffer.from(header, 'ascii'), data]);
+  const out = Buffer.allocUnsafe(data.length + 4);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  data.copy(out, 4);
+  return out;
+}
+
+/** pkt-line framing as text, for streams whose payloads are all text. */
+function pktText(payload: string): string {
+  return (Buffer.byteLength(payload, 'utf8') + 4).toString(16).padStart(4, '0') + payload;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -127,14 +147,18 @@ export function readPkts(buffer: Buffer, start = 0): PktStream {
 
 /** Frame pack bytes as side-band-64k packets (band 1), then a flush. */
 export function sidebandFrame(pack: Buffer, chunkSize = 32768): Buffer {
-  const chunks: Buffer[] = [];
-  for (let offset = 0; offset < pack.length; offset += chunkSize) {
-    const slice = pack.subarray(offset, Math.min(pack.length, offset + chunkSize));
-    chunks.push(pkt(Buffer.concat([Buffer.from([1]), slice])));
+  const chunkCount = Math.max(1, Math.ceil(pack.length / chunkSize));
+  const out = Buffer.allocUnsafe(pack.length + chunkCount * 5 + 4);
+  let written = 0;
+  for (let index = 0; index < chunkCount; index += 1) {
+    const slice = pack.subarray(index * chunkSize, Math.min(pack.length, (index + 1) * chunkSize));
+    out.write((slice.length + 5).toString(16).padStart(4, '0'), written, 'ascii');
+    out[written + 4] = 1;
+    slice.copy(out, written + 5);
+    written += slice.length + 5;
   }
-  if (pack.length === 0) chunks.push(pkt(Buffer.from([1])));
-  chunks.push(PKT_FLUSH);
-  return Buffer.concat(chunks);
+  PKT_FLUSH.copy(out, written);
+  return out;
 }
 
 // ----------------------------------------------------------- advertisement
@@ -148,27 +172,27 @@ function advertisementV0(ctx: Ctx, repo: Repo, service: 'git-upload-pack' | 'git
     service === 'git-upload-pack'
       ? `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`
       : `report-status delete-refs side-band-64k ofs-delta symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
-  const chunks: Buffer[] = [pkt(`# service=${service}\n`), PKT_FLUSH];
+  let out = pktText(`# service=${service}\n`) + '0000';
   const refs = sortedRefs(repo);
   const headTip = repo.branchTip(repo.defaultBranch);
   if (refs.length === 0) {
-    chunks.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    out += pktText(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
-    chunks.push(pkt(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`));
+    out += pktText(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`);
     for (const ref of refs) {
       const oid = repo.refs.get(ref)!;
-      chunks.push(pkt(`${oid} ${ref}\n`));
+      out += pktText(`${oid} ${ref}\n`);
       const object = ctx.forge.objects.get(oid);
       if (object !== undefined && object.type === 'tag') {
-        chunks.push(pkt(`${peelToNonTag(ctx.forge.objects, oid)} ${ref}^{}\n`));
+        out += pktText(`${peelToNonTag(ctx.forge.objects, oid)} ${ref}^{}\n`);
       }
     }
   }
-  chunks.push(PKT_FLUSH);
+  out += '0000';
   return {
     status: 200,
     headers: { ...GIT_HEADERS, 'content-type': `application/x-${service}-advertisement` },
-    body: Buffer.concat(chunks),
+    body: Buffer.from(out, 'utf8'),
   };
 }
 
@@ -434,12 +458,12 @@ export function receivePack(ctx: Ctx, repo: Repo): Reply {
   }
 
   if (!reportStatus) return { status: 200, headers: { ...GIT_HEADERS, 'content-type': 'application/x-git-receive-pack-result' }, body: Buffer.alloc(0) };
-  const inner: Buffer[] = [pkt(unpackError === null ? 'unpack ok\n' : `unpack error: ${unpackError}\n`)];
+  let reportText = pktText(unpackError === null ? 'unpack ok\n' : `unpack error: ${unpackError}\n`);
   for (const result of results) {
-    inner.push(pkt(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`));
+    reportText += pktText(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`);
   }
-  inner.push(PKT_FLUSH);
-  const report = Buffer.concat(inner);
+  reportText += '0000';
+  const report = Buffer.from(reportText, 'utf8');
   const body = useSideband ? sidebandFrame(report) : report;
   return {
     status: 200,
@@ -458,7 +482,7 @@ function applyRefUpdate(ctx: Ctx, repo: Repo, command: RefCommand, unpackError: 
   }
   if (newOid === ZERO_OID) {
     if (!repo.refs.has(ref)) return { ref, ok: false, reason: 'reference not found' };
-    repo.refs.delete(ref);
+    repo.deleteRef(ref);
     return { ref, ok: true, reason: '' };
   }
   const object = store.get(newOid);
@@ -470,6 +494,6 @@ function applyRefUpdate(ctx: Ctx, repo: Repo, command: RefCommand, unpackError: 
       return { ref, ok: false, reason: 'non-fast-forward' };
     }
   }
-  repo.refs.set(ref, newOid);
+  repo.setRef(ref, newOid);
   return { ref, ok: true, reason: '' };
 }

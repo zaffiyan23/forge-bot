@@ -60,6 +60,25 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/**
+ * The serialized issue view, cached on the issue itself. The stamp is
+ * the issue's updatedAt plus its live comment count: updatedAt is
+ * re-stamped by every PATCH (the only writer of title/body/state/labels),
+ * labels are immutable once created, and comments only ever append — so
+ * a stamp match proves the cached bytes render the exact current state.
+ * The read workload asks for one issue thousands of times; this turns
+ * those answers into a map hit and a string reuse.
+ */
+export function issueJsonText(repo: Repo, issue: Issue): string {
+  const comments = repo.comments.get(issue.number)?.length ?? 0;
+  const stamp = `${issue.updatedAt}|${comments}`;
+  if (issue.cachedJson !== undefined && issue.cachedStamp === stamp) return issue.cachedJson;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issue.cachedJson = text;
+  issue.cachedStamp = stamp;
+  return text;
+}
+
 export function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   return {
     id: pull.id,
@@ -153,7 +172,7 @@ function createRepo(ctx: Ctx): Reply {
       'commit',
       buildCommit({ tree, parents: [], name: FORGE_NAME, email: FORGE_EMAIL, timeSec, message: 'Initial commit' }),
     );
-    repo.refs.set(`refs/heads/${repo.defaultBranch}`, commit);
+    repo.setRef(`refs/heads/${repo.defaultBranch}`, commit);
   }
   return jsonReply(201, repoJson(repo));
 }
@@ -267,7 +286,7 @@ function putContents(ctx: Ctx, repo: Repo, parts: string[]): Reply {
     'commit',
     buildCommit({ tree: newTree, parents: tip === null ? [] : [tip], name: FORGE_NAME, email: FORGE_EMAIL, timeSec, message }),
   );
-  repo.refs.set(`refs/heads/${branch}`, commitOid);
+  repo.setRef(`refs/heads/${branch}`, commitOid);
   return jsonReply(isUpdate ? 200 : 201, {
     content: {
       type: 'file',
@@ -301,7 +320,7 @@ function deleteContents(ctx: Ctx, repo: Repo, parts: string[]): Reply {
     'commit',
     buildCommit({ tree: newTree, parents: [tip], name: FORGE_NAME, email: FORGE_EMAIL, timeSec, message }),
   );
-  repo.refs.set(`refs/heads/${branch}`, commitOid);
+  repo.setRef(`refs/heads/${branch}`, commitOid);
   return jsonReply(200, { content: null, commit: { sha: commitOid, message } });
 }
 
@@ -345,7 +364,7 @@ function createRef(ctx: Ctx, repo: Repo): Reply {
   if (!ref.startsWith('refs/')) return errorReply(422, 'Validation Failed: ref must start with refs/');
   if (!ctx.forge.objects.has(sha)) return errorReply(422, 'Validation Failed: sha does not name an object');
   if (repo.refs.has(ref)) return errorReply(422, 'Validation Failed: reference already exists');
-  repo.refs.set(ref, sha);
+  repo.setRef(ref, sha);
   const type = ctx.forge.objects.typeOf(sha) ?? 'commit';
   return jsonReply(201, { ref, object: { sha, type } });
 }
@@ -633,7 +652,9 @@ export function handleRest(ctx: Ctx, segments: string[]): Reply {
       const issue = Number.isInteger(number) ? repo.issues.get(number) : undefined;
       if (rest.length === 2) {
         if (issue === undefined) return errorReply(404, 'Not Found');
-        if (method === 'GET') return jsonReply(200, issueJson(repo, issue));
+        if (method === 'GET') {
+          return { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' }, body: issueJsonText(repo, issue) };
+        }
         if (method === 'PATCH') return patchIssue(ctx, repo, issue);
         return errorReply(404, 'Not Found');
       }
